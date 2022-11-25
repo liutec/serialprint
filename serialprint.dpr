@@ -7,6 +7,102 @@ uses
   SysUtils,
   StrUtils;
 
+
+function LocalPosEx(const SubStr, S: string; Offset: Integer = 1): Integer;
+asm
+  test eax, eax
+  jz @Nil
+  test edx, edx
+  jz @Nil
+  dec ecx
+  jl @Nil
+
+  push esi
+  push ebx
+
+  mov esi, [edx-4] //Length(Str)
+  mov ebx, [eax-4] //Length(Substr)
+  sub esi, ecx //effective length of Str
+  add edx, ecx //addr of the first char at starting position
+  cmp esi, ebx
+  jl @Past //jump if EffectiveLength(Str)<Length(Substr)
+  test ebx, ebx
+  jle @Past //jump if Length(Substr)<=0
+
+  add esp, -12
+  add ebx, -1 //Length(Substr)-1
+  add esi, edx //addr of the terminator
+  add edx, ebx //addr of the last char at starting position
+  mov [esp+8], esi //save addr of the terminator
+  add eax, ebx //addr of the last char of Substr
+  sub ecx, edx //-@Str[Length(Substr)]
+  neg ebx //-(Length(Substr)-1)
+  mov [esp+4], ecx //save -@Str[Length(Substr)]
+  mov [esp], ebx //save -(Length(Substr)-1)
+  movzx ecx, byte ptr [eax] //the last char of Substr
+
+@Loop:
+  cmp cl, [edx]
+  jz @Test0
+@AfterTest0:
+  cmp cl, [edx+1]
+  jz @TestT
+@AfterTestT:
+  add edx, 4
+  cmp edx, [esp+8]
+  jb @Continue
+@EndLoop:
+  add edx, -2
+  cmp edx, [esp+8]
+  jb @Loop
+@Exit:
+  add esp, 12
+@Past:
+  pop ebx
+  pop esi
+@Nil:
+  xor eax, eax
+  ret
+@Continue:
+  cmp cl, [edx-2]
+  jz @Test2
+  cmp cl, [edx-1]
+  jnz @Loop
+@Test1:
+  add edx, 1
+@Test2:
+  add edx, -2
+@Test0:
+  add edx, -1
+@TestT:
+  mov esi, [esp]
+  test esi, esi
+  jz @Found
+@String:
+  movzx ebx, word ptr [esi+eax]
+  cmp bx, word ptr [esi+edx+1]
+  jnz @AfterTestT
+  cmp esi, -2
+  jge @Found
+  movzx ebx, word ptr [esi+eax+2]
+  cmp bx, word ptr [esi+edx+3]
+  jnz @AfterTestT
+  add esi, 4
+  jl @String
+@Found:
+  mov eax, [esp+4]
+  add edx, 2
+
+  cmp edx, [esp+8]
+  ja @Exit
+
+  add esp, 12
+  add eax, edx
+  pop ebx
+  pop esi
+end;
+
+
 function WriteFileToSerial(
   sFileName: string;
   sPortName: string;
@@ -14,59 +110,80 @@ function WriteFileToSerial(
   bByteSize: Byte;
   bParity: Byte;
   bStopBits: Byte;
-  bDtrRts: Boolean
+  bDtrRts: Boolean;
+  sNumber: string;
+  bDebug: Boolean
 ): Boolean;
 const
-  iInputBufferSize = 256;
-  iOutputBufferSize = 256;
+  dwInputBufferSize = 32;
+  dwOutputBufferSize = 32;
+  dwLineBufferSize = 255;
 var
   cFileName: array [0..255] of Char;
   FDCB: TDCB;
   ctTimeouts: TCommTimeouts;
   hPort, hFile: THandle;
-  dwBytesRead, dwBytesWritten: DWORD;
-  buffer: array[1..iInputBufferSize] of AnsiChar;
+  dwBytesRead, dwBytesToWrite, dwBytesWritten: DWORD;
+  readBuffer: array[0..dwInputBufferSize-1] of AnsiChar;
+  writeBuffer: array[0..dwOutputBufferSize-1] of AnsiChar;
+  lineBuffer: array[0..dwLineBufferSize-1] of AnsiChar;
+  i, k: DWORD;
+  d, n: Integer;
+  dwLastReadBufferOffset: DWORD;
+  dwLineBufferChunkSize: DWORD;
+  dwLineBufferOffset: DWORD;
+  dwReadBufferOffset: DWORD;
+  bFailed: Boolean;
+  bEOL: Boolean;
+  bEOF: Boolean;
 begin
   StrPCopy(cFileName, '\\.\' + sPortName);
-  hPort := CreateFile(
-    cFileName,
-    GENERIC_READ or GENERIC_WRITE,
-    0,
-    NIL,
-    OPEN_EXISTING,
-    FILE_ATTRIBUTE_NORMAL,
-    0
-  );
+  if bDebug then
+    hPort := GetStdHandle(STD_OUTPUT_HANDLE)
+  else begin
+    hPort := CreateFile(
+      cFileName,
+      GENERIC_READ or GENERIC_WRITE,
+      0,
+      NIL,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL,
+      0
+    );
+  end;
   Result := False;
   try
-    if hPort = INVALID_HANDLE_VALUE then Exit;
-    if SetupComm(hPort, iInputBufferSize, iOutputBufferSize) = False then Exit;
-    if GetCommState(hPort, FDCB) = False then Exit;
-    with FDCB do
+    if not bDebug then
     begin
-      BaudRate := dwBaudRate;
-      ByteSize := bByteSize;
-      Parity := bParity;
-      StopBits := bStopBits;
-      Flags := Flags or 1;
-    end;
-    if SetCommState(hPort, FDCB) = False then Exit;
-    with ctTimeouts do
-    begin
-      ReadIntervalTimeout := MAXDWORD;
-      ReadTotalTimeoutMultiplier := 0;
-      ReadTotalTimeoutConstant := 0;
-      WriteTotalTimeoutMultiplier := 0;
-      WriteTotalTimeoutConstant := 0;
-    end;
-    SetCommTimeouts(hPort, ctTimeouts);
-    if bDtrRts then
-    begin
-      EscapeCommFunction(hPort, SETDTR);
-      EscapeCommFunction(hPort, SETRTS);
-    end else begin
-      EscapeCommFunction(hPort, CLRDTR);
-      EscapeCommFunction(hPort, CLRRTS);
+      if hPort = INVALID_HANDLE_VALUE then Exit;
+      if SetupComm(hPort, dwInputBufferSize, dwOutputBufferSize) = False then Exit;
+      if GetCommState(hPort, FDCB) = False then Exit;
+      with FDCB do
+      begin
+        BaudRate := dwBaudRate;
+        ByteSize := bByteSize;
+        Parity := bParity;
+        StopBits := bStopBits;
+        Flags := Flags or 1;
+      end;
+      if SetCommState(hPort, FDCB) = False then Exit;
+      with ctTimeouts do
+      begin
+        ReadIntervalTimeout := MAXDWORD;
+        ReadTotalTimeoutMultiplier := 0;
+        ReadTotalTimeoutConstant := 0;
+        WriteTotalTimeoutMultiplier := 5;
+        WriteTotalTimeoutConstant := 0;
+      end;
+      SetCommTimeouts(hPort, ctTimeouts);
+      if bDtrRts then
+      begin
+        EscapeCommFunction(hPort, SETDTR);
+        EscapeCommFunction(hPort, SETRTS);
+      end else begin
+        EscapeCommFunction(hPort, CLRDTR);
+        EscapeCommFunction(hPort, CLRRTS);
+      end;
     end;
     StrPCopy(cFileName, sFileName);
     hFile := CreateFile(
@@ -79,27 +196,108 @@ begin
       0
     );
     try
-      WriteFile(hPort, buffer, 1, dwBytesWritten, nil);
-      while True do
+      bFailed := False;
+      dwLineBufferOffset := 0;
+      repeat
+        if ReadFile(hFile, readBuffer, SizeOf(readBuffer), dwBytesRead, nil) then
+          bEOF := dwBytesRead = 0
+        else begin
+          bEOF := True;
+          dwBytesRead := 0;
+        end;
+        if dwBytesRead > 0 then
+          dwLastReadBufferOffset := dwBytesRead - 1
+        else
+          dwLastReadBufferOffset := 0;
+        dwReadBufferOffset := 0;
+        i := 0;
+        repeat
+          if bEOF then
+          begin
+            dwBytesToWrite := dwLineBufferOffset;
+            bEOL := True;
+          end else begin
+            bEOL := Ord(readBuffer[i]) = 10;
+            if bEOL or (i = dwLastReadBufferOffset) then
+            begin
+              dwLineBufferChunkSize := i - dwReadBufferOffset + 1;
+              dwBytesToWrite := dwLineBufferOffset + dwLineBufferChunkSize;
+              CopyMemory(
+                @lineBuffer[dwLineBufferOffset],
+                @readBuffer[dwReadBufferOffset],
+                dwLineBufferChunkSize
+              );
+              dwReadBufferOffset := i + 1;
+              if not bEOL then
+                dwLineBufferOffset := dwLineBufferOffset + dwLineBufferChunkSize;
+            end else
+              dwBytesToWrite := 0;
+          end;
+          if bEOL and (dwBytesToWrite > 0) then
+          begin
+            k := Pos('COMANDA BON : ', string(lineBuffer));
+            if k > 0 then
+            begin
+              k := k + 13;
+              n := 0;
+              while (Ord(lineBuffer[k]) >= Ord('0')) and (Ord(lineBuffer[k]) <= Ord('9')) do
+              begin
+                Inc(k);
+                Inc(n);
+              end;
+              d := Length(sNumber) - n;
+              if d <> 0 then
+              begin
+                CopyMemory(
+                  @lineBuffer[k + DWORD(d)],
+                  @lineBuffer[k],
+                  dwBytesToWrite - k
+                );
+              end;
+              CopyMemory(
+                @lineBuffer[k - DWORD(n)],
+                @sNumber[1],
+                Length(sNumber)
+              );
+              dwBytesToWrite := dwBytesToWrite + DWORD(d);
+            end else begin
+              k := Pos('powered by SOFTOK.RO', string(lineBuffer));
+              if k > 0 then
+              begin
+                StrPCopy(PAnsiChar(@lineBuffer), '       LA O IDEE SRL'#13#10);
+                dwBytesToWrite := 22;
+              end;
+            end;
+            WriteFile(hPort, lineBuffer, dwBytesToWrite, dwBytesWritten, nil);
+            if dwBytesToWrite <> dwBytesWritten then
+            begin
+              WriteLn('ERROR: failed writting to ' + sPortName + '. Check connection.');
+              bFailed := True;
+              break;
+            end;
+            dwLineBufferOffset := 0
+          end;
+          Inc(i);
+        until i > dwLastReadBufferOffset;
+      until bEOF;
+      if not bFailed then
       begin
-        if not ReadFile(hFile, buffer, SizeOf(buffer), dwBytesRead, nil) then
-          break;
-        if dwBytesRead = 0 then
-          break;
-        WriteFile(hPort, buffer, dwBytesRead, dwBytesWritten, nil);
-      end;
-      // cut page ESC @ GS V 1
-      // https://reference.epson-biz.com/modules/ref_escpos/index.php?content_id=87
-      StrPCopy(PAnsiChar(@buffer), #10#10#10#10#10#27 + '@' + #29 + 'V' + #1);
-      WriteFile(hPort, buffer, 10, dwBytesWritten, nil);
-      Result := True;
+        // cut page ESC @ GS V 1
+        // https://reference.epson-biz.com/modules/ref_escpos/index.php?content_id=87
+        StrPCopy(PAnsiChar(@writeBuffer), #10#10#10#10#10#27 + '@' + #29 + 'V' + #1);
+        WriteFile(hPort, writeBuffer, 10, dwBytesWritten, nil);
+        Result := True;
+      end else
+        Result := False;
     finally
       CloseHandle(hFile);
     end;
   finally
-    CloseHandle(hPort);
+    if not bDebug then
+      CloseHandle(hPort);
   end;
 end;
+
 
 function SplitString(var arr: array of string; str_src: string): Integer;
 var
@@ -144,19 +342,70 @@ begin
   end;
 end;
 
+function ReadLastDailyNumber(sFileName: string): Integer;
+var
+  fHandle: TextFile;
+  sNumber: string;
+begin
+  AssignFile(fHandle, sFileName);
+  try
+    try
+      Reset(fHandle);
+      ReadLn(fHandle, sNumber);
+      ReadLastDailyNumber := StrToInt(sNumber);
+    except
+      on E: EConvertError do begin
+        ReadLastDailyNumber := 0;
+      end;
+    end;
+  finally
+    CloseFile(fHandle);
+  end;
+end;
+
+procedure WriteLastDailyNumber(sFileName: string; sNumber: string);
+var
+  fHandle: TextFile;
+begin
+  AssignFile(fHandle, sFileName);
+  try
+    ReWrite(fHandle);
+    WriteLn(fHandle, sNumber);
+  finally
+    CloseFile(fHandle);
+  end;
+end;
+
 procedure main();
 var
+  i: Integer;
   txtConfigFile: TextFile;
   sConfigFileName: string;
   sConfigLine: string;
   asFields: array [0..5] of string;
   sFileName: string;
+  sDailyNumberFileName: string;
+  iNumber: Integer;
+  sNumber: string;
+  bDebug: Boolean;
 begin
   sConfigFileName := ChangeFileExt(ParamStr(0), '.config');
+  sDailyNumberFileName := ExtractFilePath(ParamStr(0)) +
+    FormatDateTime('yyyy-MM-dd', Now()) + '.txt';
+  iNumber := ReadLastDailyNumber(sDailyNumberFileName) + 1;
+  sNumber := IntToStr(iNumber);
+  bDebug := False;
   if ParamCount = 0 then
     sFileName := ExtractFilePath(ParamStr(0)) + 'data.txt'
-  else
+  else begin
+    for i := 1 to ParamCount do
+      if ParamStr(i) = '-d' then
+      begin
+        bDebug := True;
+        break;
+      end;
     sFileName := ParamStr(ParamCount);
+  end;
   WriteLn('SC MED LAD SRL');
   WriteLn('Config file: ' + sConfigFileName);
   WriteLn('Data file: ' + sFileName);
@@ -172,7 +421,7 @@ begin
 
       if SplitString(asFields, sConfigLine) = 6 then
       begin
-        WriteLn('Writing ' + sFileName + ' to ' + sConfigLine);
+        WriteLn(#13#10'Writing ' + sFileName + ' to ' + sConfigLine);
         WriteFileToSerial(
           sFileName,
           asFields[0],
@@ -180,13 +429,16 @@ begin
           StrToInt(asFields[2]),
           StrToInt(asFields[3]),
           StrToInt(asFields[4]),
-          StrToInt(asFields[5]) = 1
+          StrToInt(asFields[5]) = 1,
+          sNumber,
+          bDebug
         );
       end;
     end;
   finally
     CloseFile(txtConfigFile);
   end;
+  WriteLastDailyNumber(sDailyNumberFileName, sNumber);
 end;
 
 begin
