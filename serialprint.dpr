@@ -20,9 +20,9 @@ function WriteFileToSerial(
   bDebug: Boolean
 ): Boolean;
 const
-  dwInputBufferSize = 255;
-  dwOutputBufferSize = 255;
-  dwLineBufferSize = 255;
+  dwInputBufferSize = 512;
+  dwOutputBufferSize = 512;
+  dwLineBufferSize = 1024;
 var
   cFileName: array [0..255] of Char;
   FDCB: TDCB;
