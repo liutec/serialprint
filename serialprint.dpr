@@ -140,7 +140,7 @@ begin
           end;
           if bEOL and (dwBytesToWrite > 0) then
           begin
-            k := Pos('COMANDA BON : ', string(lineBuffer));
+            k := Pos('COMANDA Bon : ', string(lineBuffer));
             if k > 0 then
             begin
               k := k + 13;
